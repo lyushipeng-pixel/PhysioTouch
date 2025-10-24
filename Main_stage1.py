@@ -63,12 +63,25 @@ def main(args):
     random.seed(seed)  
     cudnn.benchmark = True  
 
-    # ⭐ 打印静态重建配置
-    print(f"\n{'='*60}")
-    print(f"Static-Dynamic Training Configuration:")
-    print(f"  Static ratio: {args.static_ratio:.2%}")
-    print(f"  Dynamic ratio: {1-args.static_ratio:.2%}")
-    print(f"{'='*60}\n")
+    # ⭐ 打印训练配置
+    print(f"\n{'='*70}")
+    print(f"🎯 Training Configuration:")
+    print(f"{'='*70}")
+    if args.use_joint_training:
+        print(f"  Training Mode: 🎯 Joint Training (联合训练)")
+        print(f"  ├─ Alpha (static weight):  {args.alpha}")
+        print(f"  ├─ Beta (dynamic weight):  {args.beta}")
+        print(f"  └─ Expected contribution:")
+        total_weight = args.alpha + args.beta
+        print(f"     ├─ Static:  {args.alpha/total_weight:.1%} of total loss")
+        print(f"     └─ Dynamic: {args.beta/total_weight:.1%} of total loss")
+    else:
+        print(f"  Training Mode: 🎲 Random Alternating (随机交替)")
+        print(f"  ├─ Static ratio:  {args.static_ratio:.2%}")
+        print(f"  └─ Dynamic ratio: {1-args.static_ratio:.2%}")
+    print(f"  Mask ratio: {args.mask_ratio:.1%}")
+    print(f"  Gradient monitoring: {'✅ Enabled' if args.monitor_gradient else '❌ Disabled'}")
+    print(f"{'='*70}\n")
 
     # 创建数据集和数据加载器
     dataset_train = PretrainDataset_Contact(mode='train')
@@ -146,7 +159,12 @@ def main(args):
     )
 
     print(f"Start training for {args.epochs} epochs")
-    print(f"Static reconstruction ratio: {args.static_ratio}")
+    
+    # 打印训练模式信息
+    if args.use_joint_training:
+        print(f"🎯 Joint Training Mode - Alpha: {args.alpha}, Beta: {args.beta}")
+    else:
+        print(f"🎲 Random Alternating Mode - Static ratio: {args.static_ratio}")
 
     # ⭐ 初始化 Wandb（仅主进程）
     if misc.is_main_process():
@@ -154,22 +172,72 @@ def main(args):
         run_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # 初始化 wandb
+        wandb_config = {
+            # 基础训练配置
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "learning_rate": args.lr,
+            "warmup_epochs": args.warmup_epochs,
+            "accum_iter": args.accum_iter,
+            "weight_decay": args.weight_decay,
+            "effective_batch_size": eff_batch_size,
+            
+            # MAE配置
+            "mask_ratio": args.mask_ratio,
+            "norm_pix_loss": args.norm_pix_loss,
+            "use_video": args.use_video,
+            
+            # 训练模式配置
+            "use_joint_training": args.use_joint_training,
+            "monitor_gradient": args.monitor_gradient,
+        }
+        
+        # 根据训练模式添加特定配置
+        if args.use_joint_training:
+            wandb_config.update({
+                "training_mode": "joint",
+                "alpha": args.alpha,
+                "beta": args.beta,
+                "expected_static_contribution": args.alpha / (args.alpha + args.beta),
+                "expected_dynamic_contribution": args.beta / (args.alpha + args.beta),
+            })
+        else:
+            wandb_config.update({
+                "training_mode": "alternating",
+                "static_ratio": args.static_ratio,
+            })
+        
         wandb.init(
             project="PhysioTouch-Stage1",
             name=run_name,
-            config={
-                "batch_size": args.batch_size,
-                "epochs": args.epochs,
-                "learning_rate": args.lr,
-                "warmup_epochs": args.warmup_epochs,
-                "mask_ratio": args.mask_ratio,
-                "static_ratio": args.static_ratio,
-                "accum_iter": args.accum_iter,
-                "weight_decay": args.weight_decay,
-                "norm_pix_loss": args.norm_pix_loss,
-                "use_video": args.use_video,
-            }
+            config=wandb_config,
+            tags=["joint_training" if args.use_joint_training else "alternating"],
         )
+        
+        # ⭐ 定义指标的默认显示行为（优化Wandb UI）
+        # 设置x轴为iteration（全局步数）
+        wandb.define_metric("batch/iteration")
+        wandb.define_metric("batch/*", step_metric="batch/iteration")
+        
+        # 设置epoch相关指标的x轴为epoch
+        wandb.define_metric("epoch", step_metric="epoch")
+        wandb.define_metric("epoch/*", step_metric="epoch")
+        
+        # ⭐ 为关键指标设置目标（帮助Wandb自动识别重要性）
+        if args.use_joint_training:
+            # 联合训练模式的关键指标
+            wandb.define_metric("batch/loss_total", summary="min")  # 最小化总损失
+            wandb.define_metric("batch/loss_static", summary="min")
+            wandb.define_metric("batch/loss_dynamic", summary="min")
+            wandb.define_metric("batch/loss_ratio", summary="mean")  # 平均值
+            wandb.define_metric("batch/static_contribution", summary="mean")  # ⚠️ 移除了不支持的goal参数
+            wandb.define_metric("epoch/train_loss", summary="min")
+            wandb.define_metric("epoch/best_loss_so_far", summary="min")
+            
+            print("✅ Wandb metrics configured for joint training mode")
+        else:
+            wandb.define_metric("batch/loss_total", summary="min")
+            print("✅ Wandb metrics configured for alternating mode")
         print(f"✅ Wandb initialized: Project=PhysioTouch-Stage1, Run={run_name}")
     
     # ⭐ 不使用 TensorBoard
@@ -239,12 +307,33 @@ def main(args):
                 f.write(json.dumps(log_stats) + "\n")
             
             # ⭐ 记录 epoch 级别的汇总信息到 Wandb
-            wandb.log({
+            epoch_log = {
                 "epoch": epoch,
                 "epoch/train_loss": train_stats.get('loss', 0),
                 "epoch/lr": train_stats.get('lr', 0),
                 "epoch/best_loss_so_far": best_loss,
-            })
+            }
+            
+            # 如果是联合训练，记录更详细的loss分解
+            if args.use_joint_training:
+                epoch_log.update({
+                    "epoch/loss_static": train_stats.get('loss_static', 0),
+                    "epoch/loss_dynamic": train_stats.get('loss_dynamic', 0),
+                    "epoch/loss_ratio": train_stats.get('loss_ratio', 0),
+                    "epoch/weighted_static": train_stats.get('weighted_static', 0),
+                    "epoch/weighted_dynamic": train_stats.get('weighted_dynamic', 0),
+                })
+                
+                # 计算实际的contribution比例
+                loss_static = train_stats.get('loss_static', 0)
+                loss_dynamic = train_stats.get('loss_dynamic', 0)
+                if loss_static > 0 and loss_dynamic > 0:
+                    epoch_log.update({
+                        "epoch/actual_static_contribution": (args.alpha * loss_static) / (args.alpha * loss_static + args.beta * loss_dynamic),
+                        "epoch/actual_dynamic_contribution": (args.beta * loss_dynamic) / (args.alpha * loss_static + args.beta * loss_dynamic),
+                    })
+            
+            wandb.log(epoch_log)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

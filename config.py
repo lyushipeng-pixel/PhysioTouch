@@ -30,6 +30,8 @@ def parse_args():
                         help='TensorBoard日志保存路径')
     parser.add_argument('--device', default='cuda',
                         help='训练设备: cuda 或 cpu')
+    parser.add_argument('--gpu_ids', default='0', type=str,
+                        help='指定使用的GPU ID，例如: "0" 或 "0,1,2,3"。留空则使用所有可用GPU')
     parser.add_argument('--batch_size', default=64, type=int,
                         help='每个GPU的批次大小')
     parser.add_argument('--epochs', default=400, type=int,
@@ -59,6 +61,12 @@ def parse_args():
                         help='静态损失权重（用于联合训练），默认0.5')
     parser.add_argument('--beta', type=float, default=0.5,
                         help='动态损失权重（用于联合训练），默认0.5')
+    
+    # ⭐ 新增：联合训练模式开关
+    parser.add_argument('--use_joint_training', action='store_true',
+                        help='是否使用联合训练模式（同时计算静态和动态loss）')
+    parser.add_argument('--monitor_gradient', action='store_true',
+                        help='是否监控梯度范数和冲突情况（用于调试）')
     
     # ⭐ 新增：检查点保存策略参数
     parser.add_argument('--save_freq', type=int, default=10,

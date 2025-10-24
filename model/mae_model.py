@@ -445,9 +445,9 @@ class TactileVideoMAE(nn.Module):
             # 联合训练模式：使用动态模式的 encoder/decoder
             latent, mask, ids_restore = self.forward_encoder(x[:, :3], sensor_type=sensor_type, data_type=1)
             pred = self.forward_decoder(latent, ids_restore, data_type=1, sensor_type=target_sensor_type)
-            # 计算两个 loss
-            loss_static, loss_dynamic = self.forward_loss_joint(x, pred, mask)
-            return loss_static, loss_dynamic, pred, mask
+            # 计算损失（返回4个值：static, dynamic, recon, pred）
+            loss_static, loss_dynamic, loss_recon, loss_pred = self.forward_loss_joint(x, pred, mask)
+            return loss_static, loss_dynamic, loss_recon, loss_pred, pred, mask
         else:
             # 原有模式
             if data_type == 0:
@@ -555,6 +555,8 @@ class TactileVideoMAE(nn.Module):
         Returns:
             loss_static: 第 1 帧的重建 loss (标量)
             loss_dynamic: 前 3 帧重建 + 第 4 帧预测 loss (标量)
+            loss_recon: 前 3 帧重建 loss (标量) - 用于监控
+            loss_pred: 第 4 帧预测 loss (标量) - 用于监控
         """
         # Patchify: [B, 4, 3, H, W] -> [B, L, 4, patch_dim]
         target = self.patchify(x, data_type=1)  # data_type=1 表示视频模式
@@ -587,7 +589,7 @@ class TactileVideoMAE(nn.Module):
         # 组合动态 loss
         loss_dynamic = loss_recon + loss_pred
         
-        return loss_static, loss_dynamic
+        return loss_static, loss_dynamic, loss_recon, loss_pred
 
     def patchify(self, imgs, data_type = None):
         """
