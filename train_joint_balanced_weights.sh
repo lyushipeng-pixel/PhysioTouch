@@ -55,7 +55,7 @@ torchrun \
     --master_port=$MASTER_PORT \
     Main_stage1.py \
     --batch_size 8 \
-    --epochs 100 \
+    --epochs 20 \
     --output_dir ${OUTPUT_DIR} \
     --log_dir ${OUTPUT_DIR} \
     --use_video \
