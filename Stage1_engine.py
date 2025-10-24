@@ -68,13 +68,22 @@ def train_one_epoch(
     accum_iter = args.accum_iter  
     optimizer.zero_grad()
     
-    # 获取静态模式的使用比例（默认0.5）
+    # 获取训练模式配置
+    use_joint_training = getattr(args, 'use_joint_training', False)
     static_ratio = getattr(args, 'static_ratio', 0.5)
-    print(f'Static reconstruction ratio: {static_ratio:.1%}')
+    
+    if use_joint_training:
+        print(f'🎯 Training Mode: Joint Training (联合训练)')
+        print(f'   Alpha (static weight): {args.alpha}')
+        print(f'   Beta (dynamic weight): {args.beta}')
+    else:
+        print(f'🎲 Training Mode: Random Alternating (随机交替)')
+        print(f'   Static ratio: {static_ratio:.1%}')
 
     # 统计静态和动态模式的使用次数
     static_count = 0
     dynamic_count = 0
+    joint_count = 0
 
     # ====================================================================
     # 训练循环
@@ -90,30 +99,55 @@ def train_one_epoch(
         samples = samples.to(device, non_blocking=True)  
 
         # ================================================================
-        # ⭐ 核心改动：随机选择静态或动态模式
+        # ⭐ 核心改动：联合训练 vs 随机交替
         # ================================================================
-        use_static = random.random() < static_ratio
         
         # 前向传播（使用混合精度）
         with torch.cuda.amp.autocast():  
-            if use_static:
-                # ============================================
-                # 静态模式：只使用第1帧重建
-                # ============================================
-                # 输入: [batch_size, 3, 224, 224]
-                # Loss: 单帧MAE重建损失（掩码位置）
-                loss, _, _ = model(samples[:, 0], data_type=0)
-                data_type_name = 'static'
-                static_count += 1
+            if use_joint_training:
+                # ════════════════════════════════════════════════════════
+                # 🎯 联合训练模式：同时计算静态和动态loss
+                # ════════════════════════════════════════════════════════
+                loss_static, loss_dynamic, loss_recon, loss_pred, pred, mask = model(samples, data_type='joint')
+                
+                # 检查loss有效性
+                if not math.isfinite(loss_static.item()):
+                    print(f"⚠️ Warning: loss_static is {loss_static.item()}, skipping this batch")
+                    continue
+                
+                if not math.isfinite(loss_dynamic.item()):
+                    print(f"⚠️ Warning: loss_dynamic is {loss_dynamic.item()}, skipping this batch")
+                    continue
+                
+                # 加权组合
+                alpha = args.alpha
+                beta = args.beta
+                loss = alpha * loss_static + beta * loss_dynamic
+                
+                # 记录详细信息
+                data_type_name = 'joint'
+                loss_static_value = loss_static.item()
+                loss_dynamic_value = loss_dynamic.item()
+                loss_recon_value = loss_recon.item()  # ⭐ 新增：重建损失
+                loss_pred_value = loss_pred.item()    # ⭐ 新增：预测损失
+                joint_count += 1
+                
             else:
-                # ============================================
-                # 动态模式：使用4帧重建+预测
-                # ============================================
-                # 输入: [batch_size, 4, 3, 224, 224]
-                # Loss: 前3帧重建（掩码） + 第4帧预测（全部）
-                loss, _, _ = model(samples, data_type=1)
-                data_type_name = 'dynamic'
-                dynamic_count += 1
+                # ════════════════════════════════════════════════════════
+                # 🎲 随机交替模式：每次只计算一种loss
+                # ════════════════════════════════════════════════════════
+                use_static = random.random() < static_ratio
+                
+                if use_static:
+                    # 静态模式：只使用第1帧重建
+                    loss, _, _ = model(samples[:, 0], data_type=0)
+                    data_type_name = 'static'
+                    static_count += 1
+                else:
+                    # 动态模式：使用4帧重建+预测
+                    loss, _, _ = model(samples, data_type=1)
+                    data_type_name = 'dynamic'
+                    dynamic_count += 1
 
         loss_value = loss.item()  
 
@@ -141,18 +175,36 @@ def train_one_epoch(
         
         # ================================================================
         # ⭐ 延迟创建和更新静态/动态损失 meter
-        # 修复 ZeroDivisionError: 只在实际使用时才创建 meter
         # ================================================================
-        if use_static:
-            # 静态模式：检查是否需要创建 meter
+        if use_joint_training:
+            # 🎯 联合训练模式：记录详细的loss分解
             if 'loss_static' not in metric_logger.meters:
                 metric_logger.add_meter('loss_static', misc.SmoothedValue(window_size=20, fmt='{value:.4f}'))
-            metric_logger.update(loss_static=loss_value)
-        else:
-            # 动态模式：检查是否需要创建 meter
             if 'loss_dynamic' not in metric_logger.meters:
                 metric_logger.add_meter('loss_dynamic', misc.SmoothedValue(window_size=20, fmt='{value:.4f}'))
-            metric_logger.update(loss_dynamic=loss_value)
+            if 'loss_ratio' not in metric_logger.meters:
+                metric_logger.add_meter('loss_ratio', misc.SmoothedValue(window_size=20, fmt='{value:.4f}'))
+            if 'weighted_static' not in metric_logger.meters:
+                metric_logger.add_meter('weighted_static', misc.SmoothedValue(window_size=20, fmt='{value:.4f}'))
+            if 'weighted_dynamic' not in metric_logger.meters:
+                metric_logger.add_meter('weighted_dynamic', misc.SmoothedValue(window_size=20, fmt='{value:.4f}'))
+            
+            metric_logger.update(loss_static=loss_static_value)
+            metric_logger.update(loss_dynamic=loss_dynamic_value)
+            metric_logger.update(loss_ratio=loss_static_value / (loss_dynamic_value + 1e-8))
+            metric_logger.update(weighted_static=alpha * loss_static_value)
+            metric_logger.update(weighted_dynamic=beta * loss_dynamic_value)
+            
+        else:
+            # 🎲 随机交替模式：原有逻辑
+            if use_static:
+                if 'loss_static' not in metric_logger.meters:
+                    metric_logger.add_meter('loss_static', misc.SmoothedValue(window_size=20, fmt='{value:.4f}'))
+                metric_logger.update(loss_static=loss_value)
+            else:
+                if 'loss_dynamic' not in metric_logger.meters:
+                    metric_logger.add_meter('loss_dynamic', misc.SmoothedValue(window_size=20, fmt='{value:.4f}'))
+                metric_logger.update(loss_dynamic=loss_value)
             
         # 更新学习率
         lr = optimizer.param_groups[0]["lr"]  
@@ -169,19 +221,37 @@ def train_one_epoch(
             
             # 基础信息
             wandb_log = {
-                "batch/loss": loss_value_reduce,
+                "batch/loss_total": loss_value_reduce,
                 "batch/lr": lr,
                 "batch/epoch": epoch,
                 "batch/iteration": global_step,
             }
             
-            # ⭐ 记录分 loss：静态或动态
-            if use_static:
-                wandb_log["batch/loss_static"] = loss_value_reduce
-                wandb_log["batch/mode"] = 0  # 静态模式
+            # ⭐ 联合训练 vs 随机交替的不同记录方式
+            if use_joint_training:
+                # 🎯 联合训练：记录详细的loss分解和权重信息
+                wandb_log.update({
+                    "batch/loss_static": loss_static_value,
+                    "batch/loss_dynamic": loss_dynamic_value,
+                    "batch/loss_recon": loss_recon_value,      # ⭐ 新增：动态重建损失(前3帧)
+                    "batch/loss_pred": loss_pred_value,        # ⭐ 新增：预测损失(第4帧)
+                    "batch/loss_ratio": loss_static_value / (loss_dynamic_value + 1e-8),
+                    "batch/weighted_static": alpha * loss_static_value,
+                    "batch/weighted_dynamic": beta * loss_dynamic_value,
+                    "batch/alpha": alpha,
+                    "batch/beta": beta,
+                    "batch/static_contribution": (alpha * loss_static_value) / loss_value_reduce,
+                    "batch/dynamic_contribution": (beta * loss_dynamic_value) / loss_value_reduce,
+                    "batch/mode": 2,  # 联合模式
+                })
             else:
-                wandb_log["batch/loss_dynamic"] = loss_value_reduce
-                wandb_log["batch/mode"] = 1  # 动态模式
+                # 🎲 随机交替：记录当前batch的模式
+                if use_static:
+                    wandb_log["batch/loss_static"] = loss_value_reduce
+                    wandb_log["batch/mode"] = 0  # 静态模式
+                else:
+                    wandb_log["batch/loss_dynamic"] = loss_value_reduce
+                    wandb_log["batch/mode"] = 1  # 动态模式
             
             # 上传到 Wandb
             wandb.log(wandb_log)
@@ -196,13 +266,20 @@ def train_one_epoch(
     # 打印统计信息
     print("Averaged stats:", metric_logger)
     
-    # 打印静态/动态模式使用统计
-    total_count = static_count + dynamic_count
-    if total_count > 0:
-        print(f"Static mode: {static_count} batches ({static_count/total_count:.1%})")
-        print(f"Dynamic mode: {dynamic_count} batches ({dynamic_count/total_count:.1%})")
+    # 打印模式使用统计
+    if use_joint_training:
+        print(f"🎯 Joint training: {joint_count} batches")
+        if joint_count > 0 and 'loss_static' in metric_logger.meters and 'loss_dynamic' in metric_logger.meters:
+            print(f"   Avg loss_static: {metric_logger.meters['loss_static'].global_avg:.4f}")
+            print(f"   Avg loss_dynamic: {metric_logger.meters['loss_dynamic'].global_avg:.4f}")
+            print(f"   Avg loss_ratio: {metric_logger.meters['loss_ratio'].global_avg:.4f}")
     else:
-        print("Warning: No batches processed!")
+        total_count = static_count + dynamic_count
+        if total_count > 0:
+            print(f"🎲 Static mode: {static_count} batches ({static_count/total_count:.1%})")
+            print(f"🎲 Dynamic mode: {dynamic_count} batches ({dynamic_count/total_count:.1%})")
+        else:
+            print("⚠️ Warning: No batches processed!")
     
     # 返回统计信息
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
