@@ -440,15 +440,25 @@ class TactileVideoMAE(nn.Module):
         return embeddings, mask, ids_restore
 
     def forward(self, x, sensor_type=None, data_type=None, target_sensor_type = None):
-        if data_type == 0:
-            latent, mask, ids_restore = self.forward_encoder(x, sensor_type=sensor_type, data_type=data_type)
+        # 检查是否是联合训练模式
+        if data_type == 'joint':
+            # 联合训练模式：使用动态模式的 encoder/decoder
+            latent, mask, ids_restore = self.forward_encoder(x[:, :3], sensor_type=sensor_type, data_type=1)
+            pred = self.forward_decoder(latent, ids_restore, data_type=1, sensor_type=target_sensor_type)
+            # 计算两个 loss
+            loss_static, loss_dynamic = self.forward_loss_joint(x, pred, mask)
+            return loss_static, loss_dynamic, pred, mask
         else:
-            latent, mask, ids_restore = self.forward_encoder(x[:, :3], sensor_type=sensor_type, data_type=data_type)
-        pred = self.forward_decoder(latent, ids_restore, data_type=data_type, sensor_type=target_sensor_type)
+            # 原有模式
+            if data_type == 0:
+                latent, mask, ids_restore = self.forward_encoder(x, sensor_type=sensor_type, data_type=data_type)
+            else:
+                latent, mask, ids_restore = self.forward_encoder(x[:, :3], sensor_type=sensor_type, data_type=data_type)
+            pred = self.forward_decoder(latent, ids_restore, data_type=data_type, sensor_type=target_sensor_type)
 
-        loss = self.forward_loss(x, pred, mask, data_type=data_type)
-        
-        return loss, pred, mask
+            loss = self.forward_loss(x, pred, mask, data_type=data_type)
+            
+            return loss, pred, mask
 
     def forward_encoder(self, x, sensor_type=None, data_type = None, use_mask = True):
         if data_type == 0 and self.use_same_patchemb:
@@ -532,6 +542,52 @@ class TactileVideoMAE(nn.Module):
             loss = (loss_recon * mask).sum() / mask.sum() + loss_pred.sum() / L
         
         return loss
+    
+    def forward_loss_joint(self, x, pred, mask):
+        """
+        联合计算静态和动态 loss
+        
+        Args:
+            x: [B, 4, 3, H, W] 输入的 4 帧图像
+            pred: [B, L, 4, patch_dim] 预测的 patches
+            mask: [B, L] 掩码 (1=被掩码, 0=可见)
+        
+        Returns:
+            loss_static: 第 1 帧的重建 loss (标量)
+            loss_dynamic: 前 3 帧重建 + 第 4 帧预测 loss (标量)
+        """
+        # Patchify: [B, 4, 3, H, W] -> [B, L, 4, patch_dim]
+        target = self.patchify(x, data_type=1)  # data_type=1 表示视频模式
+        
+        # 归一化 (可选)
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.e-6)**.5
+        
+        # 计算 MSE: [B, L, 4, patch_dim]
+        loss = (pred - target) ** 2
+        
+        # ========== 静态 loss：只计算第 1 帧的掩码重建 ==========
+        # 提取第 1 帧: [B, L, patch_dim]
+        loss_static = loss[:, :, 0, :].mean(dim=-1)  # [B, L]
+        # 只计算被掩码的 patches
+        loss_static = (loss_static * mask).sum() / mask.sum()  # scalar
+        
+        # ========== 动态 loss：前 3 帧重建 + 第 4 帧预测 ==========
+        # 前 3 帧重建 (掩码区域): [B, L, 3, patch_dim] -> [B, L]
+        loss_recon = loss[:, :, :3, :].mean(dim=-1).mean(dim=-1)  # [B, L]
+        loss_recon = (loss_recon * mask).sum() / mask.sum()  # scalar
+        
+        # 第 4 帧预测 (全部区域): [B, L, patch_dim] -> scalar
+        loss_pred = loss[:, :, 3, :].mean(dim=-1)  # [B, L]
+        L = loss_pred.shape[0] * loss_pred.shape[1]  # B * L
+        loss_pred = loss_pred.sum() / L  # scalar
+        
+        # 组合动态 loss
+        loss_dynamic = loss_recon + loss_pred
+        
+        return loss_static, loss_dynamic
 
     def patchify(self, imgs, data_type = None):
         """
